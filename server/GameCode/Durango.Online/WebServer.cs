@@ -294,7 +294,7 @@ public class WebServer
 
 	private readonly HttpListener _listener;
 
-	private readonly UdpClient _knockListener;
+	private UdpClient _knockListener;
 
 	private volatile bool _listenReady;
 
@@ -339,9 +339,23 @@ public class WebServer
 			Console.WriteLine("[webserver] wildcard bind denied ({0}), falling back to loopback", e.Message);
 		}
 		Listen();
-		// UDP knock: port+1 (8191) — client broadcast "Knock:<id>" แล้วเอา hostname ไปแสดงในรายชื่อ server
-		_knockListener = new UdpClient(port + 1);
-		ListenKnock();
+
+try
+{
+    _knockListener = new UdpClient(port + 1);
+    ListenKnock();
+
+    Console.WriteLine(
+        $"[webserver] UDP knock listening on port {port + 1}");
+}
+catch (SocketException e)
+{
+    _knockListener = null;
+
+    Console.WriteLine(
+        $"[webserver] UDP knock disabled on port {port + 1}: " +
+        e.Message);
+}
 	}
 
 	public void Close()
@@ -407,17 +421,28 @@ public class WebServer
 	}
 
 	private void ListenKnock()
-	{
-		try
-		{
-			_listenKnockReady = false;
-			_knockListener.BeginReceive(KnockListenerCallback, null);
-		}
-		catch (Exception)
-		{
-			_listenKnockReady = true;
-		}
-	}
+{
+    if (_knockListener == null)
+    {
+        return;
+    }
+
+    try
+    {
+        _listenKnockReady = false;
+        _knockListener.BeginReceive(
+            KnockListenerCallback,
+            null);
+    }
+    catch (Exception e)
+    {
+        Console.WriteLine(
+            "[webserver] UDP receive failed: " +
+            e.Message);
+
+        _listenKnockReady = false;
+    }
+}
 
 	private void KnockListenerCallback(IAsyncResult result)
 	{
@@ -654,10 +679,11 @@ public class WebServer
 		{
 			Listen();
 		}
-		if (_listenKnockReady)
-		{
-			ListenKnock();
-		}
+		if (_knockListener != null &&
+    _listenKnockReady)
+{
+    ListenKnock();
+}
 	}
 
 	/// <summary>
