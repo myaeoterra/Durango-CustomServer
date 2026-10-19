@@ -163,9 +163,7 @@ public class Gateway
 // Without distinct build numbers, enforcing the gate now could block compatible players.
 // Enable --min-client-version to enforce it. See Program.cs.
             string clientVersion = request.QueryString.Get("version");
-            bool compatible = MinClientVersion == null
-                              || string.IsNullOrEmpty(clientVersion)
-                              || string.CompareOrdinal(clientVersion, MinClientVersion) >= 0;
+            bool compatible = IsClientVersionCompatible(clientVersion, MinClientVersion);
             if (!compatible)
             {
                 Console.WriteLine($"[version] Rejected client version {clientVersion} (minimum required: {MinClientVersion})");
@@ -264,7 +262,12 @@ context = known;   // The caller's own character; use its on-disk save.
 
             _gameServer.Register(context);
             string token = Guid.NewGuid().ToString("N");
-            _gameServer.IssueSession(context.EntityId, token, ownerKey);
+            if (!_gameServer.IssueSession(context.EntityId, token, ownerKey))
+            {
+                return new WebServer.JsonResponse(
+                    new JObject { ["error"] = "session_capacity_reached" }.ToString(),
+                    HttpStatusCode.ServiceUnavailable);
+            }
             Console.WriteLine($"[gateway] /sessions {remoteIp} → {context.PlayerInfo.PlayerName} ({context.EntityId})" +
                               (string.IsNullOrEmpty(context.Path) ? " [temporary]" : ""));
             return new WebServer.JsonResponse(new JObject
@@ -975,6 +978,17 @@ Console.WriteLine("[gateway] /players rejected: no valid session");
         }
         if (host.Contains(':')) return "http://" + host;
         return $"http://{host}:{Port}";
+    }
+
+    private static bool IsClientVersionCompatible(string clientVersion, string minimumVersion)
+    {
+        if (string.IsNullOrWhiteSpace(minimumVersion)) return true;
+        if (!Version.TryParse(minimumVersion, out Version minimum))
+        {
+            Console.WriteLine($"[version] Invalid configured minimum version: {minimumVersion}");
+            return false;
+        }
+        return Version.TryParse(clientVersion, out Version client) && client >= minimum;
     }
 
     /// <summary>Original Gateway.cs:46 mapping: iPhonePlayer → ios, Android → android, otherwise windows.</summary>

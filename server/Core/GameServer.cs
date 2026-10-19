@@ -29,16 +29,21 @@ public class GameServer
 
     private readonly Dictionary<Connection, string> _connectionDict = new();
 
-    private readonly Dictionary<string, string> _sessionTokens = new();
+    private sealed class SessionRecord
+    {
+        public string EntityId { get; set; }
+        public string OwnerKey { get; set; }
+        public long ExpiresAtTick { get; set; }
+    }
 
-    /// <summary>
-/// Maps each session token to its account owner's key, preventing the token from being redirected to arbitrary characters.
-    ///
-/// ⚠️ Without this table, BindSessionToEntity only verifies that the server issued the token.
-/// It would not verify that the target character belongs to the token holder, allowing account takeover with a short curl sequence.
-/// Example attack: POST /sessions to get a token, then GET /entry?entity_id=&lt;victim&gt; to authenticate as the victim.
-    /// </summary>
-    private readonly Dictionary<string, string> _sessionOwners = new();
+    private const long SessionLifetimeMilliseconds = 10 * 60 * 1000;
+    private const int MaximumPendingSessions = 10_000;
+
+    private readonly Dictionary<string, SessionRecord> _sessions =
+        new(StringComparer.Ordinal);
+
+    private readonly Func<int> _onlinePlayerCount;
+    private readonly int _maximumPlayers;
 
     public World World { get; }
 
@@ -54,12 +59,21 @@ public class GameServer
 
     public int Port { get; private set; }
 
-    public GameServer(WorldContext worldCtx, PlayerContext playerCtx)
+    public int AuthenticatedConnectionCount => _connectionDict.Count;
+
+    public GameServer(
+        WorldContext worldCtx,
+        PlayerContext playerCtx,
+        Func<int> onlinePlayerCount,
+        int maximumPlayers)
     {
         _listener = new Listener();
-        Port = 8191;
+        Port = DefaultPort;
         _playerCtx = playerCtx;
         World = new World(worldCtx);
+        _onlinePlayerCount = onlinePlayerCount
+            ?? throw new ArgumentNullException(nameof(onlinePlayerCount));
+        _maximumPlayers = maximumPlayers;
     }
 
     public void Start(int port)
@@ -94,6 +108,7 @@ public class GameServer
             _connections[num].Process();
         }
         DropStaleUnauthenticated();
+        PurgeExpiredSessions();
         if (Worlds != null) Worlds.ProcessAll(); else World.Process();
     }
 
@@ -136,19 +151,77 @@ public class GameServer
         return false;
     }
 
-/// <summary>Issue a session token to the holder of account key <paramref name="ownerKey"/>.</summary>
-    public void IssueSession(string entityId, string token, string ownerKey)
+/// <summary>Issue a short-lived session token to the holder of an account key.</summary>
+    public bool IssueSession(string entityId, string token, string ownerKey)
     {
-        _sessionTokens[token] = entityId;
-        _sessionOwners[token] = ownerKey;
+        if (string.IsNullOrWhiteSpace(token) || string.IsNullOrWhiteSpace(ownerKey))
+        {
+            return false;
+        }
+
+        PurgeExpiredSessions();
+        if (_sessions.Count >= MaximumPendingSessions)
+        {
+            Console.WriteLine($"[auth] Refused session: limit reached ({_sessions.Count}/{MaximumPendingSessions})");
+            return false;
+        }
+
+        _sessions[token] = new SessionRecord
+        {
+            EntityId = entityId,
+            OwnerKey = ownerKey,
+            ExpiresAtTick = Environment.TickCount64 + SessionLifetimeMilliseconds
+        };
+        return true;
     }
 
-/// <summary>Account key associated with a token, or null if the token is unknown.</summary>
-    public string OwnerOfSession(string token) => _sessionOwners.Get(token ?? "");
+    public string OwnerOfSession(string token) =>
+        TryGetSession(token, out SessionRecord session) ? session.OwnerKey : null;
 
     public bool TryGetSessionEntityId(string token, out string entityId)
     {
-        return _sessionTokens.TryGetValue(token ?? "", out entityId);
+        if (TryGetSession(token, out SessionRecord session))
+        {
+            entityId = session.EntityId;
+            return true;
+        }
+        entityId = null;
+        return false;
+    }
+
+    private bool TryGetSession(string token, out SessionRecord session)
+    {
+        session = null;
+        if (string.IsNullOrWhiteSpace(token) || !_sessions.TryGetValue(token, out SessionRecord found))
+        {
+            return false;
+        }
+        if (Environment.TickCount64 >= found.ExpiresAtTick)
+        {
+            _sessions.Remove(token);
+            return false;
+        }
+        session = found;
+        return true;
+    }
+
+    private void PurgeExpiredSessions()
+    {
+        if (_sessions.Count == 0) return;
+        long now = Environment.TickCount64;
+        List<string> expired = null;
+        foreach (KeyValuePair<string, SessionRecord> pair in _sessions)
+        {
+            if (now < pair.Value.ExpiresAtTick) continue;
+            (expired ??= new List<string>()).Add(pair.Key);
+        }
+        if (expired == null) return;
+        foreach (string token in expired) _sessions.Remove(token);
+    }
+
+    private void ConsumeSession(string token)
+    {
+        if (!string.IsNullOrEmpty(token)) _sessions.Remove(token);
     }
 
     /// <summary>
@@ -165,32 +238,23 @@ public class GameServer
     /// </summary>
     public bool BindSessionToEntity(string token, string entityId)
     {
-        if (string.IsNullOrEmpty(token) || string.IsNullOrEmpty(entityId)
-            || !_sessionTokens.ContainsKey(token))
+        if (string.IsNullOrWhiteSpace(entityId) ||
+            !TryGetSession(token, out SessionRecord session))
         {
             return false;
         }
 
-// ⚠️ Previously, the server only checked whether a token was server-issued before rebinding it.
-// This was insufficient because anyone could request a token at /sessions without authenticating.
-// The server must also verify that the target character belongs to the account holding the token.
-        string owner = _sessionOwners.Get(token);
         PlayerContext target = _playerContexts.Get(entityId);
-
-// A character unknown to the server is newly requested for this session and has not passed through /players yet.
-// It may proceed because it has no owner; /players assigns ownership when creation is persisted.
-        if (target == null) { _sessionTokens[token] = entityId; return true; }
-
-        if (!AccountKeys.Same(owner, target.OwnerKey))
+        if (target != null && !AccountKeys.Same(session.OwnerKey, target.OwnerKey))
         {
-            Console.WriteLine($"[auth] Rejected session binding: account {AccountKeys.ForLog(owner)} " +
+            Console.WriteLine($"[auth] Rejected session binding: account {AccountKeys.ForLog(session.OwnerKey)} " +
                 $"does not own character {entityId} (owner {AccountKeys.ForLog(target.OwnerKey)})");
             return false;
         }
-        _sessionTokens[token] = entityId;
+
+        session.EntityId = entityId;
         return true;
     }
-
     /// <summary>
 /// Context for this character; null if the server does not know it.
     ///
@@ -245,31 +309,38 @@ public class GameServer
         });
         connection.Recv(delegate(Auth auth, PacketHeader header)
         {
-// [Sep 4, 2026] Previously, auth.EntityId was trusted directly, allowing clients to authenticate as any entity.
-// Authentication is now bound to the token issued by /sessions.
-            if (!TryGetSessionEntityId(auth.SessionToken, out string sessionEntityId)
-                || !string.Equals(sessionEntityId, auth.EntityId, StringComparison.Ordinal))
+            if (!TryGetSession(auth.SessionToken, out SessionRecord session) ||
+                !string.Equals(session.EntityId, auth.EntityId, StringComparison.Ordinal))
             {
-            Console.WriteLine($"[auth] Rejected: token does not match claimed entity ({auth.EntityId})");
-            connection.Send(new Abort { Text = "Authentication failed" }, header.Seq);
+                Console.WriteLine($"[auth] Rejected: token does not match claimed entity ({auth.EntityId})");
+                connection.Send(new Abort { Text = "Authentication failed" }, header.Seq);
                 connection.Close();
                 return;
             }
-            string entityId = auth.EntityId;
-            PlayerContext playerContext = GetPlayerContext(entityId);
+
+            PlayerContext playerContext = GetPlayerContext(auth.EntityId);
             if (playerContext == null)
             {
-// Unknown IDs previously fell back to the first character slot (see GetPlayerContext), allowing arbitrary IDs to connect.
-            Console.WriteLine($"[auth] Rejected: unknown character {entityId}");
-            connection.Send(new Abort { Text = "Character not found" }, header.Seq);
+                Console.WriteLine($"[auth] Rejected: unknown character {auth.EntityId}");
+                connection.Send(new Abort { Text = "Character not found" }, header.Seq);
                 connection.Close();
                 return;
             }
-            _connectionDict[connection] = entityId;
-            _pendingAuth.Remove(connection);      // Auth succeeded; timeout tracking is no longer needed.
-            SendWelcome(connection, entityId, playerContext.PlayerInfo.PlayerName, header.Seq);
-        });
-        connection.Recv(delegate(Ready ready, PacketHeader readyHeader)
+
+            int onlinePlayers = _onlinePlayerCount();
+            if (_maximumPlayers > 0 && onlinePlayers >= _maximumPlayers)
+            {
+                Console.WriteLine($"[auth] Rejected {auth.EntityId}: server is full ({onlinePlayers}/{_maximumPlayers})");
+                connection.Send(new Abort { Text = "Server is full" }, header.Seq);
+                connection.Close();
+                return;
+            }
+
+            _connectionDict[connection] = auth.EntityId;
+            _pendingAuth.Remove(connection);
+            ConsumeSession(auth.SessionToken);
+            SendWelcome(connection, auth.EntityId, playerContext.PlayerInfo.PlayerName, header.Seq);
+        });        connection.Recv(delegate(Ready ready, PacketHeader readyHeader)
         {
             string text = _connectionDict.Get(connection);
             if (string.IsNullOrEmpty(text))

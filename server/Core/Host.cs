@@ -233,7 +233,11 @@ public class Host
 
     public void Start(int gamePort, int gatewayPort, string publicHost, string androidBundlesDir, string assetsDir, string dataDir = null)
     {
-        GameServer = new GameServer(_worldCtx, _fallbackPlayer);
+        GameServer = new GameServer(
+            _worldCtx,
+            _fallbackPlayer,
+            PlayersOnline,
+            MaxPlayers);
 // The original starting-island world (0.world) is reused as the first island in the catalog.
         Worlds = new WorldRegistry(_clusterKey, GameServer.World, _worldCtx?.TerrainId);
         GameServer.Worlds = Worlds;
@@ -347,43 +351,52 @@ public class Host
     /// </summary>
     public int PlayersOnline()
     {
-        if (_worldPlayersFieldMissing) return -1;
+        if (_worldPlayersFieldMissing)
+        {
+            return GameServer?.AuthenticatedConnectionCount ?? 0;
+        }
+
         if (_worldPlayersField == null)
         {
-            _worldPlayersField = typeof(World).GetField("_players",
-                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            _worldPlayersField = typeof(World).GetField(
+                "_players",
+                System.Reflection.BindingFlags.Instance |
+                System.Reflection.BindingFlags.NonPublic);
+
             if (_worldPlayersField == null)
             {
                 _worldPlayersFieldMissing = true;
-                Console.WriteLine("[health] Could not count online players; World._players field was not found (renamed?)");
-                return -1;
+                Console.WriteLine("[health] World._players not found; using authenticated connections");
+                return GameServer?.AuthenticatedConnectionCount ?? 0;
             }
         }
+
         try
         {
             int total = 0;
             if (Worlds != null)
             {
-                foreach (KeyValuePair<string, World> kv in Worlds.Loaded)
+                foreach (KeyValuePair<string, World> pair in Worlds.Loaded)
                 {
-                    if (_worldPlayersField.GetValue(kv.Value) is System.Collections.ICollection players)
+                    if (_worldPlayersField.GetValue(pair.Value) is System.Collections.ICollection players)
                     {
                         total += players.Count;
                     }
                 }
             }
-            else if (GameServer?.World != null && _worldPlayersField.GetValue(GameServer.World) is System.Collections.ICollection one)
+            else if (GameServer?.World != null &&
+                     _worldPlayersField.GetValue(GameServer.World) is System.Collections.ICollection players)
             {
-                total = one.Count;
+                total = players.Count;
             }
             return total;
         }
-        catch (Exception)
+        catch (Exception e)
         {
-            return -1;
+            Console.WriteLine("[health] Player count fallback: " + e.GetType().Name);
+            return GameServer?.AuthenticatedConnectionCount ?? 0;
         }
     }
-
 /// <summary>Number of island worlds currently in memory; worlds are created lazily when players arrive.</summary>
     public int WorldsLoaded()
     {
