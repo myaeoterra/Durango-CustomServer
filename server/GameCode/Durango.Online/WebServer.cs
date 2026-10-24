@@ -327,7 +327,7 @@ public class WebServer
 		// (localhost + 127.0.0.1 เพื่อให้ client ที่พิมพ์ IP 127.0.0.1 ต่อได้)
 		try
 		{
-			_listener.Prefixes.Add($"http://*:{port}/");
+			_listener.Prefixes.Add($"http://+:{port}/");
 			_listener.Start();
 		}
 		catch (Exception e)

@@ -370,7 +370,7 @@ public class World
             _players.Remove(player);
             PlayerDisappeared?.Invoke(player);
         };
-        foreach (Player player2 in _players)
+        foreach (Player player2 in _players.ToArray())
         {
             player.SendAppear(player2);
         }
@@ -386,7 +386,9 @@ public class World
 
     public void BroadCast<T>(T msg)
     {
-        foreach (Player player in _players)
+        // [10 ต.ค. 2026] กัน Collection was modified — ใช้ ToArray() เพื่อทำสำเนาเธรดสำรอง
+        // เนื่องจากผู้เล่นสามารถหลุด (Remove) หรือเข้า (Add) ได้ทุกเมื่อจากเธรดเน็ตเวิร์ก
+        foreach (Player player in _players.ToArray())
         {
             player.Send(msg);
         }
@@ -404,7 +406,7 @@ public class World
     {
         BroadCast(new DisappearEntity { EntityId = animal.EntityId });
         ForgetHarvests(animal.EntityId);
-        foreach (Player player in _players)
+        foreach (Player player in _players.ToArray())
         {
             player.ForgetAnimal(animal.EntityId);
         }
@@ -824,7 +826,7 @@ public class World
         Weather = weather;
         BroadCast(new Weather { _Weather = weather });
         // [7 ก.ย. 2026] ซิงก์บัพ/ดีบัพจากอากาศให้ทุกคนบนเกาะ (ฝน→wet · ภูเขาไฟ→volcanic_*)
-        foreach (Player player in _players)
+        foreach (Player player in _players.ToArray())
         {
             player.SyncWeatherStatusEffects(weather);
         }
